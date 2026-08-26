@@ -1457,6 +1457,9 @@ LOCALVAR blnr WantHidden = falseblnr;
 
 LOCALVAR blnr WindowHidden = falseblnr;
 
+/* START_MUTED in the environment. */
+LOCALVAR blnr WantMuted = falseblnr;
+
 LOCALVAR NSWindow *MyWindow = nil;
 LOCALVAR NSView *MyNSview = nil;
 #if UseCGContextDrawImage
@@ -2724,6 +2727,15 @@ LOCALPROC MySound_UnInit(void)
 LOCALFUNC blnr MySound_Init(void)
 {
 	OSStatus result = noErr;
+
+	/*
+		Opens no audio unit, leaving `enabled` false so MySound_Start does
+		nothing. Success, because a machine without sound still runs.
+	*/
+	if (WantMuted) {
+		return trueblnr;
+	}
+
 #if UseAudioComp
 	AudioComponent comp;
 	AudioComponentDescription desc;
@@ -5539,12 +5551,6 @@ LOCALFUNC blnr InitCocoaStuff(void)
 			breaks NSApp setDelegate
 		*/
 
-	{
-		const char *said = getenv("START_HIDDEN");
-
-		WantHidden = (NULL != said) && ('0' != said[0])
-			? trueblnr : falseblnr;
-	}
 	/*
 		The LSUIElement bundle gives no Dock tile until an activation policy
 		is set. This runs before the ROM and the disks load, so the tile is
@@ -5674,8 +5680,22 @@ LOCALPROC UnallocMyMemory(void)
 	}
 }
 
+/* Reads START_HIDDEN and START_MUTED before anything acts on them. */
+LOCALPROC ReadStartupOptions(void)
+{
+	const char *hidden = getenv("START_HIDDEN");
+	const char *muted = getenv("START_MUTED");
+
+	WantHidden = (NULL != hidden) && ('0' != hidden[0])
+		? trueblnr : falseblnr;
+	WantMuted = (NULL != muted) && ('0' != muted[0])
+		? trueblnr : falseblnr;
+}
+
 LOCALFUNC blnr InitOSGLU(void)
 {
+	ReadStartupOptions();
+
 	blnr IsOk = falseblnr;
 	NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 
