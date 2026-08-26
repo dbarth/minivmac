@@ -1451,6 +1451,10 @@ LOCALFUNC blnr EntropyGather(void)
 
 #define UseCGContextDrawImage 0
 
+/* START_HIDDEN in the environment. `open` passes the environment to the app
+   it launches, but no arguments. */
+LOCALVAR blnr WantHidden = falseblnr;
+
 LOCALVAR blnr WindowHidden = falseblnr;
 
 LOCALVAR NSWindow *MyWindow = nil;
@@ -4424,7 +4428,15 @@ LOCALFUNC blnr CreateMainWindow(void)
 
 	[MyWindow setContentView: MyNSview];
 
-	[MyWindow makeKeyAndOrderFront: nil];
+	/*
+		The OpenGL context below is made against a window on screen.
+		makeKeyAndOrderFront would also unhide and activate the application.
+	*/
+	if (WantHidden) {
+		[MyWindow orderFront: nil];
+	} else {
+		[MyWindow makeKeyAndOrderFront: nil];
+	}
 
 	/*
 		just in case drawRect didn't get called
@@ -4458,6 +4470,10 @@ LOCALFUNC blnr CreateMainWindow(void)
 	v = trueblnr;
 
 label_exit:
+
+	if (v && WantHidden) {
+		ScreenShare_ShowWindow(falseblnr);
+	}
 
 	return v;
 }
@@ -5523,6 +5539,21 @@ LOCALFUNC blnr InitCocoaStuff(void)
 			breaks NSApp setDelegate
 		*/
 
+	{
+		const char *said = getenv("START_HIDDEN");
+
+		WantHidden = (NULL != said) && ('0' != said[0])
+			? trueblnr : falseblnr;
+	}
+	/*
+		The LSUIElement bundle gives no Dock tile until an activation policy
+		is set. This runs before the ROM and the disks load, so the tile is
+		up at launch.
+	*/
+	[MyNSApp setActivationPolicy: WantHidden
+		? NSApplicationActivationPolicyAccessory
+		: NSApplicationActivationPolicyRegular];
+
 	MyMenuSetup();
 
 	MyApplicationDelegate = [[MyClassApplicationDelegate alloc] init];
@@ -5746,7 +5777,13 @@ int main(int argc, char **argv)
 	ZapOSGLUVars();
 
 	if (InitOSGLU()) {
-		ScreenShare_Init();
+		/*
+			Shows the window instead: a hidden machine that cannot
+			publish could not be seen at all.
+		*/
+		if (! ScreenShare_Init() && WantHidden) {
+			ScreenShare_ShowWindow(trueblnr);
+		}
 		ProgramMain();
 		ScreenShare_UnInit();
 	}

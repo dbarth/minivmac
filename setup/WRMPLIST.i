@@ -235,6 +235,14 @@ LOCALPROC WriteMyInfoPListContents(void)
 		WritePListKeyProcString("CFBundleGetInfoString",
 			WriteGetInfoString);
 		WritePListKeyString("CFBundleIconFile", "ICONAPPO.icns");
+		/*
+			Declares the app an agent to start without a Dock tile.
+			Without this, LaunchServices adds a tile that
+			setActivationPolicy cannot remove. See START_HIDDEN in
+			OSGLUCCO.m.
+		*/
+		WriteDestFileLn("<key>LSUIElement</key>");
+		WriteDestFileLn("<true/>");
 		WritePListKeyProcString("CFBundleIdentifier",
 			WriteTheBundleIdentifier);
 		WritePListKeyString("CFBundleInfoDictionaryVersion", "6.0");
