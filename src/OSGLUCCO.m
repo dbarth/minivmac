@@ -1451,6 +1451,8 @@ LOCALFUNC blnr EntropyGather(void)
 
 #define UseCGContextDrawImage 0
 
+LOCALVAR blnr WindowHidden = falseblnr;
+
 LOCALVAR NSWindow *MyWindow = nil;
 LOCALVAR NSView *MyNSview = nil;
 #if UseCGContextDrawImage
@@ -3178,6 +3180,438 @@ LOCALPROC MyDrawChangesAndClear(void)
 	}
 }
 
+
+
+/* --- the screen, published for another process to draw --- */
+
+/*
+	Publishes the guest's screen at half size in an IOSurface and names that
+	surface over a unix socket. The socket also carries show, hide and quit.
+*/
+
+#include <IOSurface/IOSurface.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <pthread.h>
+#include <errno.h>
+
+#define ShareScale 2
+#define ShareWidth (vMacScreenWidth / ShareScale)
+#define ShareHeight (vMacScreenHeight / ShareScale)
+/* Ticks between frames. DoneWithDrawingForTick runs at 60.14 Hz, so 1 is every
+   frame the guest draws. */
+#define ShareEvery 1
+#define ShareMaxClients 8
+
+LOCALVAR IOSurfaceRef ShareSurface = NULL;
+LOCALVAR int ShareListener = -1;
+LOCALVAR char SharePath[104];
+LOCALVAR int ShareClients[ShareMaxClients];
+LOCALVAR int ShareClientCount = 0;
+LOCALVAR int ShareWatchers = 0;
+LOCALVAR pthread_mutex_t ShareLock = PTHREAD_MUTEX_INITIALIZER;
+/* The guest's bits as last published; SharePublish skips a screen that
+   matches. */
+LOCALVAR ui3b ShareLast[vMacScreenMonoNumBytes];
+LOCALVAR blnr ShareLastValid = falseblnr;
+LOCALVAR int ShareTicks = 0;
+
+LOCALPROC ShareSurfaceNumber(CFMutableDictionaryRef d, CFStringRef key, int v)
+{
+	CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &v);
+	CFDictionarySetValue(d, key, n);
+	CFRelease(n);
+}
+
+/* Names the surface to one client, or to every client for `only` < 0. The
+   surface is made once and never replaced: the guest's screen has one size. */
+LOCALPROC ShareAnnounce(int only)
+{
+	char line[160];
+	int n;
+	int i;
+
+	if (NULL == ShareSurface) {
+		return;
+	}
+	n = snprintf(line, sizeof(line),
+		"{\"ev\":\"surface\",\"id\":%u,\"width\":%d,\"height\":%d}\n",
+		(unsigned)IOSurfaceGetID(ShareSurface), ShareWidth, ShareHeight);
+	pthread_mutex_lock(&ShareLock);
+	for (i = 0; i < ShareClientCount; ++i) {
+		if ((only < 0) || (ShareClients[i] == only)) {
+			(void) write(ShareClients[i], line, n);
+		}
+	}
+	pthread_mutex_unlock(&ShareLock);
+}
+
+/* Tells every client whether a window is on screen. The close widget hides the
+   window without a client asking, so no client can track this on its own. */
+LOCALPROC ShareAnnounceWindow(blnr shown)
+{
+	char line[64];
+	int n;
+	int i;
+
+	n = snprintf(line, sizeof(line),
+		"{\"ev\":\"window\",\"shown\":%s}\n", shown ? "true" : "false");
+	pthread_mutex_lock(&ShareLock);
+	for (i = 0; i < ShareClientCount; ++i) {
+		(void) write(ShareClients[i], line, n);
+	}
+	pthread_mutex_unlock(&ShareLock);
+}
+
+/* Counts the clients on the socket, watching or not. A machine with one is
+   driven from outside. See windowShouldClose. */
+LOCALFUNC int ScreenShare_Clients(void)
+{
+	int n;
+
+	pthread_mutex_lock(&ShareLock);
+	n = ShareClientCount;
+	pthread_mutex_unlock(&ShareLock);
+	return n;
+}
+
+/* Matches `"op": "<op>"` in a JSON line, without parsing the rest. */
+LOCALFUNC blnr ShareLineSays(const char *line, const char *op)
+{
+	const char *at = strstr(line, "\"op\"");
+	size_t n;
+
+	if (NULL == at) {
+		return falseblnr;
+	}
+	at = strchr(at + 4, ':');
+	if (NULL == at) {
+		return falseblnr;
+	}
+	while ((':' == *at) || (' ' == *at) || ('\t' == *at)) {
+		++at;
+	}
+	if ('"' != *at) {
+		return falseblnr;
+	}
+	++at;
+	n = strlen(op);
+	return (0 == strncmp(at, op, n)) && ('"' == at[n]);
+}
+
+/*
+	Puts the window on screen or off it, and the Dock tile with it. Hops to the
+	main thread: AppKit runs there, and the socket reader threads call this.
+*/
+LOCALPROC ScreenShare_ShowWindow(blnr shown)
+{
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if (shown) {
+			[NSApp setActivationPolicy:
+				NSApplicationActivationPolicyRegular];
+			[MyWindow makeKeyAndOrderFront: nil];
+			[NSApp activateIgnoringOtherApps: YES];
+			WindowHidden = falseblnr;
+		} else {
+			[MyWindow orderOut: nil];
+			[NSApp setActivationPolicy:
+				NSApplicationActivationPolicyAccessory];
+			WindowHidden = trueblnr;
+		}
+		ShareAnnounceWindow(shown);
+	});
+}
+
+LOCALPROC ShareCountWatcher(int by)
+{
+	pthread_mutex_lock(&ShareLock);
+	ShareWatchers += by;
+	if (ShareWatchers < 0) {
+		ShareWatchers = 0;
+	}
+	/* Forces a whole frame for a reader that has just arrived. The guest's
+	   screen can go minutes without moving. */
+	if (by > 0) {
+		ShareLastValid = falseblnr;
+		ShareTicks = ShareEvery;
+	}
+	pthread_mutex_unlock(&ShareLock);
+}
+
+/* Serves one client until it closes the socket, one op to a line. An
+   unrecognised op is dropped. */
+LOCALFUNC void *ShareConnection(void *given)
+{
+	int c = (int)(intptr_t)given;
+	blnr watching = falseblnr;
+	char buf[512];
+	size_t held = 0;
+	ssize_t got;
+	blnr room;
+
+	pthread_mutex_lock(&ShareLock);
+	room = ShareClientCount < ShareMaxClients;
+	if (room) {
+		ShareClients[ShareClientCount++] = c;
+	}
+	pthread_mutex_unlock(&ShareLock);
+	if (! room) {
+		close(c);
+		return NULL;
+	}
+	ShareAnnounce(c);
+
+	while ((got = read(c, buf + held, sizeof(buf) - held - 1)) > 0) {
+		char *line = buf;
+		char *end;
+
+		held += got;
+		buf[held] = '\0';
+		while (NULL != (end = strchr(line, '\n'))) {
+			*end = '\0';
+			if (ShareLineSays(line, "quit")) {
+				/*
+					RequestMacOff would put a warning on screen
+					that nobody answers on a hidden machine.
+				*/
+				ForceMacOff = trueblnr;
+			} else if (ShareLineSays(line, "show")) {
+				ScreenShare_ShowWindow(trueblnr);
+			} else if (ShareLineSays(line, "hide")) {
+				ScreenShare_ShowWindow(falseblnr);
+			} else if (ShareLineSays(line, "watch") && ! watching) {
+				watching = trueblnr;
+				ShareCountWatcher(1);
+			} else if (ShareLineSays(line, "unwatch") && watching) {
+				watching = falseblnr;
+				ShareCountWatcher(-1);
+			}
+			line = end + 1;
+		}
+		held = strlen(line);
+		memmove(buf, line, held + 1);
+	}
+
+	if (watching) {
+		ShareCountWatcher(-1);
+	}
+	pthread_mutex_lock(&ShareLock);
+	{
+		int i;
+		for (i = 0; i < ShareClientCount; ++i) {
+			if (ShareClients[i] == c) {
+				ShareClients[i] = ShareClients[--ShareClientCount];
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&ShareLock);
+	close(c);
+	return NULL;
+}
+
+LOCALFUNC void *ShareAcceptLoop(void *given)
+{
+	UnusedParam(given);
+	for (;;) {
+		pthread_t t;
+		int c = accept(ShareListener, NULL, NULL);
+
+		if (c < 0) {
+			if (EINTR == errno) {
+				continue;
+			}
+			return NULL;	/* the listener is closed */
+		}
+		if (0 != pthread_create(&t, NULL, ShareConnection,
+			(void *)(intptr_t)c))
+		{
+			close(c);
+		} else {
+			pthread_detach(t);
+		}
+	}
+}
+
+/*
+	Listens on ~/.localtalk/vm/minivmac-<pid>.sock. The name comes from the pid
+	because `main` ignores argc and argv, and `open -n -a` passes no arguments.
+*/
+LOCALFUNC blnr ShareOpenSocket(void)
+{
+	struct sockaddr_un sa;
+	const char *home = getenv("HOME");
+	char dir[80];
+	pthread_t t;
+
+	if (NULL == home) {
+		return falseblnr;
+	}
+	snprintf(dir, sizeof(dir), "%s/.localtalk/vm", home);
+	(void) mkdir(dir, 0755);
+	snprintf(SharePath, sizeof(SharePath), "%s/minivmac-%d.sock",
+		dir, (int)getpid());
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	if (strlen(SharePath) >= sizeof(sa.sun_path)) {
+		return falseblnr;
+	}
+	strlcpy(sa.sun_path, SharePath, sizeof(sa.sun_path));
+	unlink(SharePath);
+
+	ShareListener = socket(AF_UNIX, SOCK_STREAM, 0);
+	if ((ShareListener < 0)
+		|| (bind(ShareListener, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+		|| (listen(ShareListener, 4) < 0))
+	{
+		if (ShareListener >= 0) {
+			close(ShareListener);
+			ShareListener = -1;
+		}
+		SharePath[0] = '\0';
+		return falseblnr;
+	}
+
+	/* A write to a socket whose reader has gone would kill the process. */
+	signal(SIGPIPE, SIG_IGN);
+	if (0 != pthread_create(&t, NULL, ShareAcceptLoop, NULL)) {
+		return falseblnr;
+	}
+	pthread_detach(t);
+	return trueblnr;
+}
+
+LOCALFUNC blnr ShareOpenSurface(void)
+{
+	CFMutableDictionaryRef props = CFDictionaryCreateMutable(NULL, 0,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+	ShareSurfaceNumber(props, kIOSurfaceWidth, ShareWidth);
+	ShareSurfaceNumber(props, kIOSurfaceHeight, ShareHeight);
+	ShareSurfaceNumber(props, kIOSurfaceBytesPerElement, 4);
+	ShareSurfaceNumber(props, kIOSurfacePixelFormat, 'BGRA');
+	/* Readers can look up a surface by id only if it is marked global. */
+	CFDictionarySetValue(props, kIOSurfaceIsGlobal, kCFBooleanTrue);
+	ShareSurface = IOSurfaceCreate(props);
+	CFRelease(props);
+	return (NULL != ShareSurface) ? trueblnr : falseblnr;
+}
+
+LOCALFUNC blnr ScreenShare_Init(void)
+{
+	if (! ShareOpenSurface()) {
+		return falseblnr;
+	}
+	if (! ShareOpenSocket()) {
+		CFRelease(ShareSurface);
+		ShareSurface = NULL;
+		return falseblnr;
+	}
+	return trueblnr;
+}
+
+LOCALPROC ScreenShare_UnInit(void)
+{
+	if (ShareListener >= 0) {
+		close(ShareListener);
+		ShareListener = -1;
+	}
+	if ('\0' != SharePath[0]) {
+		unlink(SharePath);
+		SharePath[0] = '\0';
+	}
+	if (NULL != ShareSurface) {
+		CFRelease(ShareSurface);
+		ShareSurface = NULL;
+	}
+}
+
+/*
+	Averages each 2x2 block of the guest's 1-bit rows (high bit leftmost, a set
+	bit black) into one of five greys, which keeps half-size text out of moire.
+*/
+LOCALPROC ShareConvert(const ui3b *src, ui3b *dst, size_t stride)
+{
+	const int rowbytes = vMacScreenWidth / 8;
+	int y;
+
+	for (y = 0; y < ShareHeight; ++y) {
+		const ui3b *r0 = src + ((size_t)(2 * y) * rowbytes);
+		const ui3b *r1 = r0 + rowbytes;
+		ui3b *out = dst + ((size_t)y * stride);
+		int x;
+
+		for (x = 0; x < ShareWidth; ++x) {
+			int a = 2 * x;
+			int b = a + 1;
+			int dark =
+				((r0[a >> 3] >> ((~a) & 7)) & 1)
+				+ ((r0[b >> 3] >> ((~b) & 7)) & 1)
+				+ ((r1[a >> 3] >> ((~a) & 7)) & 1)
+				+ ((r1[b >> 3] >> ((~b) & 7)) & 1);
+			ui3b v = (ui3b)(255 - ((dark * 255 + 2) / 4));
+
+			out[0] = v;
+			out[1] = v;
+			out[2] = v;
+			out[3] = 0xFF;
+			out += 4;
+		}
+	}
+}
+
+LOCALPROC SharePublish(void)
+{
+	const ui3b *src;
+	int watchers;
+
+	if (NULL == ShareSurface) {
+		return;
+	}
+	pthread_mutex_lock(&ShareLock);
+	watchers = ShareWatchers;
+	pthread_mutex_unlock(&ShareLock);
+	if (0 == watchers) {
+		/* Drops the cache while nobody watches: the next watcher gets a
+		   whole frame. */
+		ShareLastValid = falseblnr;
+		return;
+	}
+
+#if 0 != vMacScreenDepth
+	if (UseColorMode) {
+		return;			/* colour is not published */
+	}
+#endif
+
+	src = (const ui3b *)GetCurDrawBuff();
+	if (ShareLastValid
+		&& (0 == memcmp(src, ShareLast, vMacScreenMonoNumBytes)))
+	{
+		return;			/* the screen has not moved */
+	}
+	memcpy(ShareLast, src, vMacScreenMonoNumBytes);
+	ShareLastValid = trueblnr;
+
+	if (kIOReturnSuccess != IOSurfaceLock(ShareSurface, 0, NULL)) {
+		return;
+	}
+	ShareConvert(src, (ui3b *)IOSurfaceGetBaseAddress(ShareSurface),
+		IOSurfaceGetBytesPerRow(ShareSurface));
+	IOSurfaceUnlock(ShareSurface, 0, NULL);
+}
+
+LOCALPROC ShareTick(void)
+{
+	if (++ShareTicks >= ShareEvery) {
+		ShareTicks = 0;
+		SharePublish();
+	}
+}
+
+
 GLOBALOSGLUPROC DoneWithDrawingForTick(void)
 {
 #if EnableFSMouseMotion
@@ -3186,6 +3620,7 @@ GLOBALOSGLUPROC DoneWithDrawingForTick(void)
 	}
 #endif
 	MyDrawChangesAndClear();
+	ShareTick();
 }
 
 /* --- keyboard input --- */
@@ -3632,6 +4067,14 @@ typedef NSUInteger (*modifierFlagsProcPtr)
 
 - (BOOL)windowShouldClose:(id)sender
 {
+	if (ScreenShare_Clients() > 0) {
+		/*
+			Hands the window back to the client; the machine goes on
+			running with nothing on screen.
+		*/
+		ScreenShare_ShowWindow(falseblnr);
+		return NO;
+	}
 	RequestMacOff = trueblnr;
 	return NO;
 }
@@ -5303,7 +5746,9 @@ int main(int argc, char **argv)
 	ZapOSGLUVars();
 
 	if (InitOSGLU()) {
+		ScreenShare_Init();
 		ProgramMain();
+		ScreenShare_UnInit();
 	}
 	UnInitOSGLU();
 
