@@ -3326,6 +3326,7 @@ LOCALPROC ScreenShare_ShowWindow(blnr shown)
 		if (shown) {
 			[NSApp setActivationPolicy:
 				NSApplicationActivationPolicyRegular];
+			[MyWindow setAlphaValue: 1.0];
 			[MyWindow makeKeyAndOrderFront: nil];
 			[NSApp activateIgnoringOtherApps: YES];
 			WindowHidden = falseblnr;
@@ -4400,6 +4401,14 @@ LOCALFUNC blnr CreateMainWindow(void)
 			no need to set current_video as it's the
 			default for NSWindows
 		*/
+	/*
+		Transparent for the ~12ms before the window is ordered out again:
+		the window server draws it in that gap often enough to see.
+	*/
+	if (WantHidden) {
+		[MyWindow setAlphaValue: 0.0];
+	}
+
 	QZ_SetCaption();
 	[MyWindow setAcceptsMouseMovedEvents: YES];
 	[MyWindow setViewsNeedDisplay: NO];
